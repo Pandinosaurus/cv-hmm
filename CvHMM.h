@@ -1,6 +1,37 @@
 /*
- *      C++ Main Header of Hidden Markov Model for OpenCV (CvHMM).
- *		
+ *      CvHMM -- Discrete Hidden Markov Models on top of OpenCV.
+ *
+ *      A Hidden Markov Model describes a chain of hidden states that you
+ *      cannot observe directly. What you *can* see is, at every time
+ *      step, one noisy symbol emitted by the current hidden state. Given
+ *      such a model and a sequence of observations, there are three
+ *      classical questions:
+ *
+ *        1. How likely is this observation sequence?       -> decode()
+ *        2. Which hidden states most plausibly produced it? -> viterbi()
+ *        3. What model best explains a set of observations? -> train()
+ *                                                             trainBatch()
+ *
+ *      The three hidden-layer matrices are:
+ *
+ *        TRANS[i, j]  probability of moving from state i to state j
+ *        EMIS[i, k]   probability of emitting symbol k while in state i
+ *        INIT[i]      probability of starting in state i
+ *
+ *      All arithmetic runs in scaled or log-space to stay numerically
+ *      stable even for long sequences.
+ *
+ *      The single-sequence algorithms (viterbi, decode, train) are a
+ *      line-by-line transcription of the pseudo-code in
+ *          Mark Stamp, "A Revealing Introduction to Hidden Markov Models",
+ *          https://www.cs.sjsu.edu/~stamp/RUA/HMM.pdf
+ *      specifically Section 5 (underflow-resistant Viterbi) and Section 7
+ *      (scaled forward-backward and Baum-Welch re-estimation).
+ *
+ *      The multi-sequence trainer (trainBatch) is the standard pooling
+ *      extension you'll find in any HMM textbook (Rabiner, 1989). It is
+ *      NOT part of Stamp's tutorial.
+ *
  * Copyright (c) 2012 Omid B. Sakhi
  * All rights reserved.
  *
@@ -26,461 +57,635 @@
 #ifndef CVHMM_H
 #define CVHMM_H
 
+#include <algorithm>
+#include <cfloat>
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
+#include <vector>
+
 #include <opencv2/core/core.hpp>
-#include <opencv2/highgui/highgui.hpp>
 
 class CvHMM {
 public:
-	CvHMM(){};
-	/* Generates M sequence of states and emissions from a Markov model */
-	static void generate(const int &_N,const int &_M, const cv::Mat &_TRANS,const cv::Mat &_EMIS, const cv::Mat &_INIT, cv::Mat &seq, cv::Mat &states)
-	{
-		seq = cv::Mat(_M,_N,CV_32S);
-		states = cv::Mat(_M,_N,CV_32S);
-		for (int i=0;i<_M;i++)
-		{
-			cv::Mat seq_,states_;
-			generate(_N,_TRANS,_EMIS,_INIT,seq_,states_);
-			for (int t=0;t<_N;t++)
-			{
-				seq.at<int>(i,t) = seq_.at<int>(0,t);
-				states.at<int>(i,t) = states_.at<int>(0,t);
-			}
-		}
+    CvHMM() {}
 
-	}
-	/* Generates a sequence of states and emissions from a Markov model */
-	static void generate(const int &_N,const cv::Mat &_TRANS,const cv::Mat &_EMIS, const cv::Mat &_INIT, cv::Mat &seq, cv::Mat &states)
-	{			
-		seq = cv::Mat(1,_N,CV_32S);
-		states = cv::Mat(1,_N,CV_32S);
-		int n_states = _TRANS.rows;
-		cv::Mat cumulative_emis(_EMIS.size(),CV_64F); 
-		for (int r=0;r<cumulative_emis.rows;r++)
-			cumulative_emis.at<double>(r,0) = _EMIS.at<double>(r,0);
-		for (int r=0;r<cumulative_emis.rows;r++)
-			for (int c=1;c<cumulative_emis.cols;c++)
-				cumulative_emis.at<double>(r,c) = cumulative_emis.at<double>(r,c-1) + _EMIS.at<double>(r,c);
-		cv::Mat cumulative_trans(_TRANS.size(),CV_64F); 
-		for (int r=0;r<cumulative_trans.rows;r++)
-			cumulative_trans.at<double>(r,0) = _TRANS.at<double>(r,0);
-		for (int r=0;r<cumulative_trans.rows;r++)
-			for (int c=1;c<cumulative_trans.cols;c++)
-				cumulative_trans.at<double>(r,c) = cumulative_trans.at<double>(r,c-1) + _TRANS.at<double>(r,c);
-		cv::Mat cumulative_init(_INIT.size(),CV_64F);
-		cumulative_init.at<double>(0,0) = _INIT.at<double>(0,0);
-		for (int c=1;c<cumulative_init.cols;c++)
-			cumulative_init.at<double>(0,c) = cumulative_init.at<double>(0,c-1) + _INIT.at<double>(0,c);
-		double r_init,r_trans,r_emis;
-		r_init = (double) rand()/RAND_MAX;
-		int last_state;
-		for (int c=0;c<cumulative_init.cols;c++)
-			if (r_init <= cumulative_init.at<double>(0,c))
-			{
-				last_state = c;
-				break;
-			}		
-		for (int t=0;t<_N;t++)
-		{
-			r_trans = (double)rand()/RAND_MAX;			
-			for (int i=0;i<cumulative_trans.cols;i++)			
-				if (r_trans <= cumulative_trans.at<double>(last_state,i))
-				{
-					states.at<int>(0,t) = i;
-					break;
-				}
-			r_emis = (double)rand()/RAND_MAX;			
-			for (int i=0;i<cumulative_emis.cols;i++)
-			{
-				if (r_emis <= cumulative_emis.at<double>(states.at<int>(0,t),i))
-				{
-					seq.at<int>(0,t) = i;
-					break;
-				}			
-			}
-			last_state = states.at<int>(0,t);
-		}
-	}
+    /* =================================================================
+     * correctModel -- keep zeros out of the model.
+     *
+     * Walks TRANS, EMIS, INIT, replaces any exact zero with a tiny
+     * epsilon (1e-30), then divides each row by its sum so the rows
+     * again sum to 1.
+     *
+     * Why: Viterbi works in log-space, so log(0) = -inf would poison
+     * the arithmetic. The scaled forward-backward and Baum-Welch are
+     * also happier with strictly positive probabilities.
+     * ================================================================= */
+    static void correctModel(cv::Mat &TRANS, cv::Mat &EMIS, cv::Mat &INIT)
+    {
+        const double eps = 1e-30;
+        for (int i = 0; i < TRANS.rows; i++)
+            for (int j = 0; j < TRANS.cols; j++)
+                if (TRANS.at<double>(i, j) == 0) TRANS.at<double>(i, j) = eps;
+        for (int i = 0; i < EMIS.rows; i++)
+            for (int j = 0; j < EMIS.cols; j++)
+                if (EMIS.at<double>(i, j) == 0) EMIS.at<double>(i, j) = eps;
+        for (int j = 0; j < INIT.cols; j++)
+            if (INIT.at<double>(0, j) == 0) INIT.at<double>(0, j) = eps;
 
-	/* Calculates the most probable state path for a hidden Markov model */
-	static void viterbi(const cv::Mat &seq, const cv::Mat &_TRANS, const cv::Mat &_EMIS, const cv::Mat &_INIT, cv::Mat &states)
-	{
-		/* Viterbi Algorithm, Wikipedia */
-		cv::Mat TRANS = _TRANS.clone();
-		cv::Mat EMIS = _EMIS.clone();
-		cv::Mat INIT = _INIT.clone();
-		correctModel(TRANS,EMIS,INIT);
-		int nseq = seq.cols;
-		int nstates = TRANS.cols;		
-		int nobs = EMIS.cols;		
-		cv::Mat v(nstates,nseq,CV_64F);
-        cv::Mat path(nstates,nseq,CV_32S); path = 0.0f;
-        cv::Mat newpath(nstates,nseq,CV_32S); newpath = 0.0f;
-		for (int y=0;y<nstates;y++)
-		{
-			v.at<double>(y,0) = log(INIT.at<double>(0,y)) + log(EMIS.at<double>(y,seq.at<int>(0,0)));
-			path.at<int>(y,0) = y;
-		}
-		double maxp,p;
-		int state;
-		for (int t=1;t<nseq;t++)
-		{			
-			for (int y=0;y<nstates;y++)
-			{
-				maxp = -DBL_MAX;
-				state = y;
-				for (int y0=0;y0<nstates;y0++)
-				{					
-					p = v.at<double>(y0,t-1) + log(TRANS.at<double>(y0,y)) + log(EMIS.at<double>(y,seq.at<int>(0,t)));			
-					if (maxp<p)
-					{						
-						maxp = p;
-						state = y0;
-					}
-				}			
-				v.at<double>(y,t) = maxp;				
-				for (int t1=0;t1<t;t1++)
-					newpath.at<int>(y,t1) = path.at<int>(state,t1);
-				newpath.at<int>(y,t) = y;
-			}
-			path.release();
-			path = newpath.clone();
-		}
-		maxp = -DBL_MAX;		
-		for (int y=0;y<nstates;y++)
-		{						
-			if (maxp < v.at<double>(y,nseq-1))
-			{
-				maxp = v.at<double>(y,nseq-1);
-				state = y;
-			}
-		}		
-		states = path.row(state).clone();
-	}
+        for (int i = 0; i < TRANS.rows; i++) {
+            double s = 0;
+            for (int j = 0; j < TRANS.cols; j++) s += TRANS.at<double>(i, j);
+            for (int j = 0; j < TRANS.cols; j++) TRANS.at<double>(i, j) /= s;
+        }
+        for (int i = 0; i < EMIS.rows; i++) {
+            double s = 0;
+            for (int j = 0; j < EMIS.cols; j++) s += EMIS.at<double>(i, j);
+            for (int j = 0; j < EMIS.cols; j++) EMIS.at<double>(i, j) /= s;
+        }
+        double s = 0;
+        for (int j = 0; j < INIT.cols; j++) s += INIT.at<double>(0, j);
+        for (int j = 0; j < INIT.cols; j++) INIT.at<double>(0, j) /= s;
+    }
 
-	/*  Calculates the posterior state probabilities of a sequence of emissions */
-    static void decode(const cv::Mat &seq,const cv::Mat &_TRANS,const cv::Mat &_EMIS, const cv::Mat &_INIT, double &logpseq, cv::Mat &PSTATES, cv::Mat &FORWARD, cv::Mat &BACKWARD)
-	{
-		/* A Revealing Introduction to Hidden Markov Models, Mark Stamp */
-		// 1. Initialization
-		cv::Mat TRANS = _TRANS.clone();
-		cv::Mat EMIS = _EMIS.clone();
-		cv::Mat INIT = _INIT.clone();
-		correctModel(TRANS,EMIS,INIT);
-		int T = seq.cols; // number of element per sequence
-		int C = seq.rows; // number of sequences
-		int N = TRANS.rows; // number of states | also N = TRANS.cols | TRANS = A = {a_{i,j}} - NxN
-		int M = EMIS.cols; // number of observations | EMIS = B = {b_{j}(k)} - NxM				
-		// compute a_{0}	
-		FORWARD = cv::Mat(N,T,CV_64F);
-		cv::Mat c(1,T,CV_64F); c.at<double>(0,0) = 0;
-		for (int i=0;i<N;i++)
-		{
-			FORWARD.at<double>(i,0) = INIT.at<double>(0,i)*EMIS.at<double>(i,seq.at<int>(0,0));
-			c.at<double>(0,0) += FORWARD.at<double>(i,0); 
-		}
-		// scale the a_{0}(i)
-		c.at<double>(0,0) = 1/c.at<double>(0,0);
-		for (int i=0;i<N;i++)
-			FORWARD.at<double>(i,0) *= c.at<double>(0,0);
-		// 2. The a-pass
-		// compute a_{t}(i)
-		for (int t=1;t<T;t++)
-		{
-			c.at<double>(0,t) = 0;
-			for (int i=0;i<N;i++)
-			{
-				FORWARD.at<double>(i,t) = 0;
-				for (int j=0;j<N;j++)				
-					FORWARD.at<double>(i,t) += FORWARD.at<double>(i,t-1)*TRANS.at<double>(j,i);
-				FORWARD.at<double>(i,t) = FORWARD.at<double>(i,t) * EMIS.at<double>(i,seq.at<int>(0,t));
-				c.at<double>(0,t)+=FORWARD.at<double>(i,t);
-			}
-			// scale a_{t}(i)
-			c.at<double>(0,t) = 1/c.at<double>(0,t);
-			for (int i=0;i<N;i++)
-				FORWARD.at<double>(i,t)=c.at<double>(0,t)*FORWARD.at<double>(i,t);
-		}
-		// 3. The B-pass
-		BACKWARD = cv::Mat(N,T,CV_64F);
-		// Let B_{t-1}(i) = 1 scaled by C_{t-1}
-		for (int i=0;i<N;i++)
-			BACKWARD.at<double>(i,T-1) = c.at<double>(0,T-1);
-		// B-pass
-		for (int t=T-2;t>-1;t--)
-			for (int i=0;i<N;i++)
-			{
-				BACKWARD.at<double>(i,t) = 0;
-				for (int j=0;j<N;j++)
-					BACKWARD.at<double>(i,t) += TRANS.at<double>(i,j)*EMIS.at<double>(j,seq.at<int>(0,t+1))*BACKWARD.at<double>(j,t+1);
-				// scale B_{t}(i) with same scale factor as a_{t}(i)
-				BACKWARD.at<double>(i,t) *= c.at<double>(0,t);
-			}
-		// 4. 
-		// Compute Y_{t}(i,j) : The probability of being in state i at time t and transiting to state j at time t+1
-		// Compute Y_{t}(i) 
-		double denom;
-		int index;		
-		
-		PSTATES = cv::Mat(N,T,CV_64F);
-		cv::Mat YNN(N*N,T,CV_64F);
-		for (int t=0;t<T-1;t++)
-		{
-			denom = 0;
-			for (int i=0;i<N;i++)
-				for (int j=0;j<N;j++)
-					denom += FORWARD.at<double>(i,t)*TRANS.at<double>(i,j)*EMIS.at<double>(j,seq.at<int>(0,t+1))*BACKWARD.at<double>(j,t+1);
-			index = 0;
-			for (int i=0;i<N;i++)
-			{
-				PSTATES.at<double>(i,t) = 0;
-				for (int j=0;j<N;j++)
-				{
-					YNN.at<double>(index,t) = (FORWARD.at<double>(i,t)*TRANS.at<double>(i,j)*EMIS.at<double>(j,seq.at<int>(0,t+1))*BACKWARD.at<double>(j,t+1))/denom;
-					PSTATES.at<double>(i,t)+=YNN.at<double>(index,t);
-					index++;
-				}
-			}
-		}
-		// 6. Compute log[P(O|y)]
-		logpseq = 0;
-		for (int i=0;i<T;i++)
-			logpseq += log(c.at<double>(0,i));
-		logpseq *= -1;
-	}
-	
-	static void getUniformModel(const int &n_states,const int &n_observations, cv::Mat &TRANS,cv::Mat &EMIS,cv::Mat &INIT)
-	{
-		TRANS = cv::Mat(n_states,n_states,CV_64F);
-		TRANS = 1.0/n_states;
-		INIT = cv::Mat(1,n_states,CV_64F);
-		INIT = 1.0/n_states;
-		EMIS = cv::Mat(n_states,n_observations,CV_64F);
-		EMIS = 1.0/n_observations;
-	}
+    // Build a "don't know anything" initial guess: N hidden states, M
+    // observation symbols, every probability set to 1/N or 1/M.
+    static void getUniformModel(int N, int M, cv::Mat &TRANS, cv::Mat &EMIS, cv::Mat &INIT)
+    {
+        TRANS = cv::Mat(N, N, CV_64F, cv::Scalar(1.0 / N)).clone();
+        EMIS  = cv::Mat(N, M, CV_64F, cv::Scalar(1.0 / M)).clone();
+        INIT  = cv::Mat(1, N, CV_64F, cv::Scalar(1.0 / N)).clone();
+    }
 
-	/* Calculates maximum likelihood estimates of transition and emission probabilities from a sequence of emissions */
-	static void train(const cv::Mat &seq, const int max_iter, cv::Mat &TRANS, cv::Mat &EMIS, cv::Mat &INIT,bool UseUniformPrior = false)
-	{
-		/* A Revealing Introduction to Hidden Markov Models, Mark Stamp */
-		// 1. Initialization
-		int iters = 0;				
-		int T = seq.cols; // number of element per sequence
-		int C = seq.rows; // number of sequences
-		int N = TRANS.rows; // number of states | also N = TRANS.cols | TRANS = A = {aij} - NxN
-		int M = EMIS.cols; // number of observations | EMIS = B = {bj(k)} - NxM		
-		correctModel(TRANS,EMIS,INIT);
-		cv::Mat FTRANS,FINIT,FEMIS;
-		if (UseUniformPrior)
-			getUniformModel(N,M,FTRANS,FEMIS,FINIT);
-		else
-		{
-			FTRANS = TRANS.clone();
-			FEMIS = EMIS.clone();
-			FINIT = INIT.clone();
-		}
-		double logProb = -DBL_MAX;
-		double oldLogProb;
-		int data = 0;
-		do {
-			oldLogProb = logProb;
+    /* =================================================================
+     * Sampling helpers -- draw synthetic observation sequences from a
+     * known model. Useful for sanity-checking the inference routines on
+     * a problem whose ground truth you already know.
+     *
+     * Randomness comes from std::rand(), so call std::srand(...) in the
+     * caller if you want reproducible runs.
+     * ================================================================= */
 
-			// compute a0		
-			cv::Mat a(N,T,CV_64F);
-			cv::Mat c(1,T,CV_64F); c.at<double>(0,0) = 0;
-			for (int i=0;i<N;i++)
-			{
-				a.at<double>(i,0) = INIT.at<double>(0,i)*EMIS.at<double>(i,seq.at<int>(0,0));
-				c.at<double>(0,0) += a.at<double>(i,0); 
-			}
-			// scale the a0(i)
-			c.at<double>(0,0) = 1/c.at<double>(0,0);
-			for (int i=0;i<N;i++)
-				a.at<double>(i,0) *= c.at<double>(0,0);
-							
-			// 2. The a-pass
-			// compute at(i)
-			for (int t=1;t<T;t++)
-			{
-				c.at<double>(0,t) = 0;
-				for (int i=0;i<N;i++)
-				{
-					a.at<double>(i,t) = 0;
-					for (int j=0;j<N;j++)				
-						a.at<double>(i,t) += a.at<double>(i,t-1)*TRANS.at<double>(j,i);
-					a.at<double>(i,t) = a.at<double>(i,t) * EMIS.at<double>(i,seq.at<int>(data,t));
-					c.at<double>(0,t)+=a.at<double>(i,t);
-				}
-				// scale at(i)
-				c.at<double>(0,t) = 1/c.at<double>(0,t);
-				for (int i=0;i<N;i++)
-					a.at<double>(i,t)=c.at<double>(0,t)*a.at<double>(i,t);
-			}
-			// 3. The B-pass
-			cv::Mat b(N,T,CV_64F);
-			// Let Bt-1(i) = 1 scaled by Ct-1
-			for (int i=0;i<N;i++)
-				b.at<double>(i,T-1) = c.at<double>(0,T-1);
-			// B-pass
-			for (int t=T-2;t>-1;t--)
-				for (int i=0;i<N;i++)
-				{
-					b.at<double>(i,t) = 0;
-					for (int j=0;j<N;j++)
-						b.at<double>(i,t) += TRANS.at<double>(i,j)*EMIS.at<double>(j,seq.at<int>(data,t+1))*b.at<double>(j,t+1);
-					// scale Bt(i) with same scale factor as at(i)
-					b.at<double>(i,t) *= c.at<double>(0,t);
-				}
-			// 4. Compute  Yt(i,j) and Yt(i)
-			double denom;
-			int index;
-			cv::Mat YN(N,T,CV_64F);
-			cv::Mat YNN(N*N,T,CV_64F);
-			for (int t=0;t<T-1;t++)
-			{
-				denom = 0;
-				for (int i=0;i<N;i++)
-					for (int j=0;j<N;j++)
-						denom += a.at<double>(i,t)*TRANS.at<double>(i,j)*EMIS.at<double>(j,seq.at<int>(data,t+1))*b.at<double>(j,t+1);
-				index = 0;
-				for (int i=0;i<N;i++)
-				{
-					YN.at<double>(i,t) = 0;
-					for (int j=0;j<N;j++)
-					{
-						YNN.at<double>(index,t) = (a.at<double>(i,t)*TRANS.at<double>(i,j)*EMIS.at<double>(j,seq.at<int>(data,t+1))*b.at<double>(j,t+1))/denom;
-						YN.at<double>(i,t)+=YNN.at<double>(index,t);
-						index++;
-					}
-				}
-			}
-			// 5. Re-estimate A,B and pi
-			// re-estimate pi		
-			for (int i=0;i<N;i++)
-				INIT.at<double>(0,i) = YN.at<double>(i,0);
-			// re-estimate A
-			double numer;
-			index = 0;
-			for (int i=0;i<N;i++)
-				for (int j=0;j<N;j++)
-				{
-					numer = 0;
-					denom = 0;
-					for (int t=0;t<T-1;t++)
-					{
-						numer += YNN.at<double>(index,t);
-						denom += YN.at<double>(i,t);
-					}
-					TRANS.at<double>(i,j) = numer/denom;
-					index++;
-				}
-			// re-estimate B
-			for (int i=0;i<N;i++)
-				for (int j=0;j<M;j++)
-				{
-					numer = 0;
-					denom = 0; 
-					for (int t=0;t<T-1;t++)
-					{
-						if (seq.at<int>(data,t)==j) 
-							numer+=YN.at<double>(i,t);
-						denom += YN.at<double>(i,t);
-					}
-					EMIS.at<double>(i,j) = numer/denom;
-				}
-			correctModel(TRANS,EMIS,INIT);
-			FTRANS = (FTRANS*(data+1)+TRANS)/(data+2);
-			FEMIS = (FEMIS*(data+1)+EMIS)/(data+2);
-			FINIT = (FINIT*(data+1)+INIT)/(data+2);
-			// 6. Compute log[P(O|y)]
-			logProb = 0;
-			for (int i=0;i<T;i++)
-				logProb += log(c.at<double>(0,i));
-			logProb *= -1;
-			// 7. To iterate or not
-			data++;
-			if (data >= C)
-			{
-				data = 0;
-				iters++;
-			}
-		} while (iters<max_iter && logProb>oldLogProb);
-		correctModel(FTRANS,FEMIS,FINIT);
-		TRANS = FTRANS.clone();
-		EMIS = FEMIS.clone();
-		INIT = FINIT.clone();
-	}
-	static void correctModel(cv::Mat &TRANS, cv::Mat &EMIS, cv::Mat &INIT)
-	{
-		double eps = 1e-30;
-		for (int i=0;i<EMIS.rows;i++)
-			for (int j=0;j<EMIS.cols;j++)
-				if (EMIS.at<double>(i,j)==0)
-					EMIS.at<double>(i,j)=eps;
-		for (int i=0;i<TRANS.rows;i++)
-			for (int j=0;j<TRANS.cols;j++)
-				if (TRANS.at<double>(i,j)==0)
-					TRANS.at<double>(i,j)=eps;
-		for (int i=0;i<INIT.cols;i++)
-			if (INIT.at<double>(0,i)==0)
-				INIT.at<double>(0,i)=eps;
-		double sum;
-		for (int i=0;i<TRANS.rows;i++)
-		{
-			sum = 0;
-			for (int j=0;j<TRANS.cols;j++)
-				sum+=TRANS.at<double>(i,j);
-			for (int j=0;j<TRANS.cols;j++)
-				TRANS.at<double>(i,j)/=sum;
-		}
-		for (int i=0;i<EMIS.rows;i++)
-		{
-			sum = 0;
-			for (int j=0;j<EMIS.cols;j++)
-				sum+=EMIS.at<double>(i,j);
-			for (int j=0;j<EMIS.cols;j++)
-				EMIS.at<double>(i,j)/=sum;
-		}
-		sum = 0;
-		for (int j=0;j<INIT.cols;j++)
-			sum+=INIT.at<double>(0,j);
-		for (int j=0;j<INIT.cols;j++)
-			INIT.at<double>(0,j)/=sum;
-	}
-	static void printPaths(const cv::Mat &PATHS,const cv::Mat &P, const int &t)
-	{		
-		for (int r=0;r<PATHS.rows;r++)
-		{			
-			for (int c=0;c<=t;c++)
-				std::cout << PATHS.at<int>(r,c);			
-			std::cout << " - " << P.at<double>(r,t) << "\n";
-		}
-	}
-	static void printModel(const cv::Mat &TRANS,const cv::Mat &EMIS,const cv::Mat &INIT)
-	{
-		std::cout << "\nTRANS: \n";
-		for (int r=0;r<TRANS.rows;r++)
-		{
-			for (int c=0;c<TRANS.cols;c++)
-				std::cout << TRANS.at<double>(r,c) << " ";
-			std::cout << "\n";
-		}
-		std::cout << "\nEMIS: \n";
-		for (int r=0;r<EMIS.rows;r++)
-		{
-			for (int c=0;c<EMIS.cols;c++)
-				std::cout << EMIS.at<double>(r,c) << " ";
-			std::cout << "\n";
-		}
-		std::cout << "\nINIT: \n";
-		for (int r=0;r<INIT.rows;r++)
-		{
-			for (int c=0;c<INIT.cols;c++)
-				std::cout << INIT.at<double>(r,c) << " ";
-			std::cout << "\n";
-		}
-		std::cout << "\n";
-	}
+    // Roll the dice according to row `r` of `probs` (treated as a
+    // discrete distribution over columns) and return the chosen column.
+    static int sampleRow(const cv::Mat &probs, int r)
+    {
+        const double x = (double)std::rand() / (double)RAND_MAX;
+        double acc = 0;
+        for (int c = 0; c < probs.cols; c++) {
+            acc += probs.at<double>(r, c);
+            if (x <= acc) return c;
+        }
+        return probs.cols - 1;
+    }
+
+    // Generate a single length-T observation sequence and its hidden states.
+    static void generate(int T,
+                         const cv::Mat &TRANS, const cv::Mat &EMIS, const cv::Mat &INIT,
+                         cv::Mat &seq, cv::Mat &states)
+    {
+        seq    = cv::Mat(1, T, CV_32S);
+        states = cv::Mat(1, T, CV_32S);
+
+        int s = sampleRow(INIT, 0);
+        states.at<int>(0, 0) = s;
+        seq   .at<int>(0, 0) = sampleRow(EMIS, s);
+        for (int t = 1; t < T; t++) {
+            s = sampleRow(TRANS, s);
+            states.at<int>(0, t) = s;
+            seq   .at<int>(0, t) = sampleRow(EMIS, s);
+        }
+    }
+
+    // Convenience: generate `numSeq` independent sequences of length T,
+    // one per row of `seq` / `states`.
+    static void generate(int T, int numSeq,
+                         const cv::Mat &TRANS, const cv::Mat &EMIS, const cv::Mat &INIT,
+                         cv::Mat &seq, cv::Mat &states)
+    {
+        seq    = cv::Mat(numSeq, T, CV_32S);
+        states = cv::Mat(numSeq, T, CV_32S);
+        for (int r = 0; r < numSeq; r++) {
+            cv::Mat srow, strow;
+            generate(T, TRANS, EMIS, INIT, srow, strow);
+            for (int c = 0; c < T; c++) {
+                seq   .at<int>(r, c) = srow .at<int>(0, c);
+                states.at<int>(r, c) = strow.at<int>(0, c);
+            }
+        }
+    }
+
+    /* =================================================================
+     * viterbi -- Given a model and an observation sequence, find the
+     * single most likely sequence of hidden states.
+     *
+     * This is the classic dynamic-programming algorithm: at every time
+     * step t and every possible state i we remember
+     *
+     *   delta_t(i) = log-probability of the best state path that ends
+     *                in state i at time t
+     *   psi_t(i)   = which state at time t-1 gave us that best path
+     *
+     * Once we've filled in delta for all t, we pick the best final
+     * state and follow the back-pointers in psi backwards to recover
+     * the whole path.
+     *
+     * Working in log-space keeps long sequences from underflowing to 0.
+     * See Stamp, Section 5, for the pseudo-code this mirrors.
+     *
+     * Input : seq is a 1 x T matrix of int observation indices (CV_32S).
+     * Output: states is a 1 x T matrix of int state indices (CV_32S).
+     * ================================================================= */
+    static void viterbi(const cv::Mat &seq,
+                        const cv::Mat &_TRANS, const cv::Mat &_EMIS, const cv::Mat &_INIT,
+                        cv::Mat &states)
+    {
+        cv::Mat TRANS = _TRANS.clone();
+        cv::Mat EMIS  = _EMIS .clone();
+        cv::Mat INIT  = _INIT .clone();
+        correctModel(TRANS, EMIS, INIT);
+
+        const int T = seq.cols;
+        const int N = TRANS.rows;
+
+        cv::Mat delta(N, T, CV_64F);
+        cv::Mat psi  (N, T, CV_32S, cv::Scalar(0));
+
+        for (int i = 0; i < N; i++)
+            delta.at<double>(i, 0) = std::log(INIT.at<double>(0, i))
+                                   + std::log(EMIS.at<double>(i, seq.at<int>(0, 0)));
+
+        for (int t = 1; t < T; t++) {
+            for (int i = 0; i < N; i++) {
+                const double logB = std::log(EMIS.at<double>(i, seq.at<int>(0, t)));
+                double best = -DBL_MAX;
+                int    arg  = 0;
+                for (int j = 0; j < N; j++) {
+                    const double v = delta.at<double>(j, t - 1)
+                                   + std::log(TRANS.at<double>(j, i))
+                                   + logB;
+                    if (v > best) { best = v; arg = j; }
+                }
+                delta.at<double>(i, t) = best;
+                psi  .at<int>   (i, t) = arg;
+            }
+        }
+
+        double best = -DBL_MAX;
+        int    arg  = 0;
+        for (int i = 0; i < N; i++)
+            if (delta.at<double>(i, T - 1) > best) {
+                best = delta.at<double>(i, T - 1);
+                arg  = i;
+            }
+
+        states = cv::Mat(1, T, CV_32S);
+        states.at<int>(0, T - 1) = arg;
+        for (int t = T - 2; t >= 0; t--)
+            states.at<int>(0, t) = psi.at<int>(states.at<int>(0, t + 1), t + 1);
+    }
+
+    /* =================================================================
+     * decode -- Score a sequence and compute per-timestep state
+     * probabilities using the forward-backward algorithm.
+     *
+     * This answers two of the most common HMM questions at once:
+     *
+     *   * "How likely is this observation sequence under the model?"
+     *     We return log P(O | lambda) in `logpseq`. Using the log
+     *     avoids underflow: probabilities can easily become 10^-300 for
+     *     even modest T.
+     *
+     *   * "Given everything we observed, what's the probability that
+     *     the hidden state at time t was state i?"
+     *     We return these "posteriors" gamma_t(i) in `PSTATES[i, t]`.
+     *
+     * To get there we compute two tables:
+     *
+     *   FORWARD [i, t] = P(O_0..O_t, X_t = i | lambda)   (alpha_hat, scaled)
+     *   BACKWARD[i, t] = P(O_{t+1}..O_{T-1} | X_t = i, lambda) (beta_hat, scaled)
+     *
+     * "Scaled" means we renormalise each column of FORWARD to sum to 1
+     * and remember the scale factors c_t. log P(O|lambda) then pops out
+     * as -sum_t log(c_t). See Stamp, Section 7.
+     *
+     * Input : seq is a 1 x T CV_32S observation sequence.
+     * ================================================================= */
+    static void decode(const cv::Mat &seq,
+                       const cv::Mat &_TRANS, const cv::Mat &_EMIS, const cv::Mat &_INIT,
+                       double &logpseq, cv::Mat &PSTATES,
+                       cv::Mat &FORWARD, cv::Mat &BACKWARD)
+    {
+        cv::Mat TRANS = _TRANS.clone();
+        cv::Mat EMIS  = _EMIS .clone();
+        cv::Mat INIT  = _INIT .clone();
+        correctModel(TRANS, EMIS, INIT);
+
+        const int T = seq.cols;
+        const int N = TRANS.rows;
+
+        FORWARD  = cv::Mat(N, T, CV_64F);
+        BACKWARD = cv::Mat(N, T, CV_64F);
+        cv::Mat c(1, T, CV_64F, cv::Scalar(0));
+
+        // Step 2: alpha-pass (scaled).
+        for (int i = 0; i < N; i++) {
+            FORWARD.at<double>(i, 0) =
+                INIT.at<double>(0, i) * EMIS.at<double>(i, seq.at<int>(0, 0));
+            c.at<double>(0, 0) += FORWARD.at<double>(i, 0);
+        }
+        c.at<double>(0, 0) = 1.0 / c.at<double>(0, 0);
+        for (int i = 0; i < N; i++)
+            FORWARD.at<double>(i, 0) *= c.at<double>(0, 0);
+
+        for (int t = 1; t < T; t++) {
+            c.at<double>(0, t) = 0;
+            for (int i = 0; i < N; i++) {
+                double sum = 0;
+                for (int j = 0; j < N; j++)
+                    sum += FORWARD.at<double>(j, t - 1) * TRANS.at<double>(j, i);
+                FORWARD.at<double>(i, t) = sum * EMIS.at<double>(i, seq.at<int>(0, t));
+                c.at<double>(0, t) += FORWARD.at<double>(i, t);
+            }
+            c.at<double>(0, t) = 1.0 / c.at<double>(0, t);
+            for (int i = 0; i < N; i++)
+                FORWARD.at<double>(i, t) *= c.at<double>(0, t);
+        }
+
+        // Step 3: beta-pass (scaled with same c_t as alpha).
+        for (int i = 0; i < N; i++)
+            BACKWARD.at<double>(i, T - 1) = c.at<double>(0, T - 1);
+        for (int t = T - 2; t >= 0; t--) {
+            for (int i = 0; i < N; i++) {
+                double sum = 0;
+                for (int j = 0; j < N; j++)
+                    sum += TRANS.at<double>(i, j)
+                         * EMIS.at<double>(j, seq.at<int>(0, t + 1))
+                         * BACKWARD.at<double>(j, t + 1);
+                BACKWARD.at<double>(i, t) = c.at<double>(0, t) * sum;
+            }
+        }
+
+        // Step 4: gamma_t(i) for t = 0 .. T-2, plus the special case at T-1.
+        PSTATES = cv::Mat(N, T, CV_64F, cv::Scalar(0));
+        for (int t = 0; t < T - 1; t++) {
+            for (int i = 0; i < N; i++) {
+                double g = 0;
+                for (int j = 0; j < N; j++)
+                    g += FORWARD.at<double>(i, t) * TRANS.at<double>(i, j)
+                       * EMIS.at<double>(j, seq.at<int>(0, t + 1))
+                       * BACKWARD.at<double>(j, t + 1);
+                PSTATES.at<double>(i, t) = g;
+            }
+        }
+        for (int i = 0; i < N; i++)
+            PSTATES.at<double>(i, T - 1) = FORWARD.at<double>(i, T - 1);
+
+        // Step 6: log P(O | lambda) = -sum_t log(c_t).
+        logpseq = 0;
+        for (int t = 0; t < T; t++)
+            logpseq += std::log(c.at<double>(0, t));
+        logpseq = -logpseq;
+    }
+
+    /* =================================================================
+     * train -- Learn the model parameters from a single observation
+     * sequence using the Baum-Welch algorithm.
+     *
+     * Baum-Welch is Expectation-Maximisation applied to HMMs. Each
+     * iteration does two things:
+     *
+     *   E-step: using the current guess of TRANS, EMIS, INIT, run
+     *           forward-backward on the data to compute
+     *             gamma_t(i)     = P(X_t = i | O, lambda)
+     *             digamma_t(i,j) = P(X_t = i, X_{t+1} = j | O, lambda)
+     *
+     *   M-step: treat those expected counts as if they were real counts
+     *           and re-estimate the model in closed form:
+     *             pi_i   = gamma_0(i)
+     *             a_{ij} = sum_t digamma_t(i, j) / sum_t gamma_t(i)
+     *             b_i(k) = sum_{t: O_t = k} gamma_t(i) / sum_t gamma_t(i)
+     *
+     * The log-likelihood log P(O | lambda) is guaranteed to go up (or
+     * stay the same) every iteration; we stop as soon as it plateaus,
+     * or after `maxIters`.
+     *
+     * This is the full seven-step procedure from Stamp, Section 7.
+     *
+     * On entry TRANS, EMIS, INIT are the initial guess. On exit they
+     * hold the re-estimated model.
+     *
+     * Note: single-sequence learning only works well when your single
+     * sequence actually visits every state many times (an "ergodic"
+     * chain). If your model has an absorbing state or a long transient,
+     * use `trainBatch` on many short sequences instead.
+     * ================================================================= */
+    static void train(const cv::Mat &seq, int maxIters,
+                      cv::Mat &TRANS, cv::Mat &EMIS, cv::Mat &INIT)
+    {
+        correctModel(TRANS, EMIS, INIT);
+
+        const int T = seq.cols;
+        const int N = TRANS.rows;
+        const int M = EMIS.cols;
+
+        cv::Mat a    (N, T, CV_64F);
+        cv::Mat b    (N, T, CV_64F);
+        cv::Mat c    (1, T, CV_64F);
+        cv::Mat gamma(N, T, CV_64F);
+        std::vector<cv::Mat> digamma(T);  // digamma[t] is N x N, used for t = 0..T-2
+
+        double oldLogProb = -DBL_MAX;
+        int    iters      = 0;
+
+        while (true) {
+            // -------- Step 2: alpha-pass --------
+            c.at<double>(0, 0) = 0;
+            for (int i = 0; i < N; i++) {
+                a.at<double>(i, 0) = INIT.at<double>(0, i)
+                                   * EMIS.at<double>(i, seq.at<int>(0, 0));
+                c.at<double>(0, 0) += a.at<double>(i, 0);
+            }
+            c.at<double>(0, 0) = 1.0 / c.at<double>(0, 0);
+            for (int i = 0; i < N; i++)
+                a.at<double>(i, 0) *= c.at<double>(0, 0);
+
+            for (int t = 1; t < T; t++) {
+                c.at<double>(0, t) = 0;
+                for (int i = 0; i < N; i++) {
+                    double sum = 0;
+                    for (int j = 0; j < N; j++)
+                        sum += a.at<double>(j, t - 1) * TRANS.at<double>(j, i);
+                    a.at<double>(i, t) = sum * EMIS.at<double>(i, seq.at<int>(0, t));
+                    c.at<double>(0, t) += a.at<double>(i, t);
+                }
+                c.at<double>(0, t) = 1.0 / c.at<double>(0, t);
+                for (int i = 0; i < N; i++)
+                    a.at<double>(i, t) *= c.at<double>(0, t);
+            }
+
+            // -------- Step 3: beta-pass --------
+            for (int i = 0; i < N; i++)
+                b.at<double>(i, T - 1) = c.at<double>(0, T - 1);
+            for (int t = T - 2; t >= 0; t--) {
+                for (int i = 0; i < N; i++) {
+                    double sum = 0;
+                    for (int j = 0; j < N; j++)
+                        sum += TRANS.at<double>(i, j)
+                             * EMIS.at<double>(j, seq.at<int>(0, t + 1))
+                             * b.at<double>(j, t + 1);
+                    b.at<double>(i, t) = c.at<double>(0, t) * sum;
+                }
+            }
+
+            // -------- Step 4: gamma_t(i) and gamma_t(i, j) --------
+            for (int t = 0; t < T - 1; t++) {
+                digamma[t] = cv::Mat(N, N, CV_64F);
+                for (int i = 0; i < N; i++) {
+                    double g = 0;
+                    for (int j = 0; j < N; j++) {
+                        const double v = a.at<double>(i, t) * TRANS.at<double>(i, j)
+                                       * EMIS.at<double>(j, seq.at<int>(0, t + 1))
+                                       * b.at<double>(j, t + 1);
+                        digamma[t].at<double>(i, j) = v;
+                        g += v;
+                    }
+                    gamma.at<double>(i, t) = g;
+                }
+            }
+            for (int i = 0; i < N; i++)
+                gamma.at<double>(i, T - 1) = a.at<double>(i, T - 1);
+
+            // -------- Step 5: re-estimate pi, A, B --------
+            for (int i = 0; i < N; i++)
+                INIT.at<double>(0, i) = gamma.at<double>(i, 0);
+
+            for (int i = 0; i < N; i++) {
+                double denom = 0;
+                for (int t = 0; t < T - 1; t++) denom += gamma.at<double>(i, t);
+                for (int j = 0; j < N; j++) {
+                    double numer = 0;
+                    for (int t = 0; t < T - 1; t++) numer += digamma[t].at<double>(i, j);
+                    TRANS.at<double>(i, j) = numer / denom;
+                }
+            }
+
+            for (int i = 0; i < N; i++) {
+                double denom = 0;
+                for (int t = 0; t < T; t++) denom += gamma.at<double>(i, t);
+                for (int j = 0; j < M; j++) {
+                    double numer = 0;
+                    for (int t = 0; t < T; t++)
+                        if (seq.at<int>(0, t) == j) numer += gamma.at<double>(i, t);
+                    EMIS.at<double>(i, j) = numer / denom;
+                }
+            }
+
+            correctModel(TRANS, EMIS, INIT);
+
+            // -------- Step 6: log P(O | lambda) --------
+            double logProb = 0;
+            for (int t = 0; t < T; t++)
+                logProb += std::log(c.at<double>(0, t));
+            logProb = -logProb;
+
+            // -------- Step 7: iterate or not --------
+            iters++;
+            if (iters >= maxIters || logProb <= oldLogProb) break;
+            oldLogProb = logProb;
+        }
+    }
+
+    /* =================================================================
+     * trainBatch -- Learn the model from K independent observation
+     * sequences at once.
+     *
+     * Same idea as `train`: run forward-backward on the data, turn the
+     * resulting posterior counts into a new model, repeat. The only
+     * difference is that the expected counts are *pooled* across all K
+     * sequences before the M-step:
+     *
+     *   pi_i   = average of gamma^(k)_0(i) over k = 1..K
+     *   a_{ij} = (sum_k sum_t digamma^(k)_t(i,j)) / (sum_k sum_t gamma^(k)_t(i))
+     *   b_i(m) = (sum_k sum_{t: O^(k)_t=m} gamma^(k)_t(i)) / (sum_k sum_t gamma^(k)_t(i))
+     *
+     * Use this when you have many short independent sequences rather
+     * than one long one. It's the only way to learn a model whose
+     * chain isn't ergodic (e.g. a left-right model with an absorbing
+     * state): any single realisation will quickly be swallowed by the
+     * absorbing state and won't contain enough information to pin down
+     * the transitions out of the transient states.
+     *
+     * Convergence: the *total* log-likelihood sum_k log P(O^(k) | lambda)
+     * is monotonic non-decreasing; we stop when it plateaus or after
+     * `maxIters` iterations.
+     *
+     * This is the standard multi-sequence extension (Rabiner, 1989).
+     * It is NOT in Stamp's tutorial.
+     *
+     *   seqs    K x T CV_32S (each row is one sequence)
+     *   TRANS, EMIS, INIT : initial guess in, re-estimated out.
+     * ================================================================= */
+    static void trainBatch(const cv::Mat &seqs, int maxIters,
+                           cv::Mat &TRANS, cv::Mat &EMIS, cv::Mat &INIT)
+    {
+        correctModel(TRANS, EMIS, INIT);
+
+        const int K = seqs.rows;
+        const int T = seqs.cols;
+        const int N = TRANS.rows;
+        const int M = EMIS.cols;
+
+        cv::Mat a    (N, T, CV_64F);
+        cv::Mat b    (N, T, CV_64F);
+        cv::Mat c    (1, T, CV_64F);
+        cv::Mat gamma(N, T, CV_64F);
+        std::vector<cv::Mat> digamma(T);
+        for (int t = 0; t < T; t++)
+            digamma[t] = cv::Mat(N, N, CV_64F);
+
+        double oldLogProb = -DBL_MAX;
+        int    iters      = 0;
+
+        while (true) {
+            cv::Mat piAcc = cv::Mat::zeros(1, N, CV_64F);
+            cv::Mat aNum  = cv::Mat::zeros(N, N, CV_64F);
+            cv::Mat aDen  = cv::Mat::zeros(1, N, CV_64F);
+            cv::Mat bNum  = cv::Mat::zeros(N, M, CV_64F);
+            cv::Mat bDen  = cv::Mat::zeros(1, N, CV_64F);
+            double totalLogProb = 0;
+
+            for (int k = 0; k < K; k++) {
+                // -- alpha-pass on sequence k --
+                c.at<double>(0, 0) = 0;
+                for (int i = 0; i < N; i++) {
+                    a.at<double>(i, 0) = INIT.at<double>(0, i)
+                                       * EMIS.at<double>(i, seqs.at<int>(k, 0));
+                    c.at<double>(0, 0) += a.at<double>(i, 0);
+                }
+                c.at<double>(0, 0) = 1.0 / c.at<double>(0, 0);
+                for (int i = 0; i < N; i++)
+                    a.at<double>(i, 0) *= c.at<double>(0, 0);
+
+                for (int t = 1; t < T; t++) {
+                    c.at<double>(0, t) = 0;
+                    for (int i = 0; i < N; i++) {
+                        double sum = 0;
+                        for (int j = 0; j < N; j++)
+                            sum += a.at<double>(j, t - 1) * TRANS.at<double>(j, i);
+                        a.at<double>(i, t) = sum * EMIS.at<double>(i, seqs.at<int>(k, t));
+                        c.at<double>(0, t) += a.at<double>(i, t);
+                    }
+                    c.at<double>(0, t) = 1.0 / c.at<double>(0, t);
+                    for (int i = 0; i < N; i++)
+                        a.at<double>(i, t) *= c.at<double>(0, t);
+                }
+
+                // -- beta-pass on sequence k --
+                for (int i = 0; i < N; i++)
+                    b.at<double>(i, T - 1) = c.at<double>(0, T - 1);
+                for (int t = T - 2; t >= 0; t--) {
+                    for (int i = 0; i < N; i++) {
+                        double sum = 0;
+                        for (int j = 0; j < N; j++)
+                            sum += TRANS.at<double>(i, j)
+                                 * EMIS.at<double>(j, seqs.at<int>(k, t + 1))
+                                 * b.at<double>(j, t + 1);
+                        b.at<double>(i, t) = c.at<double>(0, t) * sum;
+                    }
+                }
+
+                // -- gamma and digamma on sequence k --
+                for (int t = 0; t < T - 1; t++) {
+                    for (int i = 0; i < N; i++) {
+                        double g = 0;
+                        for (int j = 0; j < N; j++) {
+                            const double v = a.at<double>(i, t) * TRANS.at<double>(i, j)
+                                           * EMIS.at<double>(j, seqs.at<int>(k, t + 1))
+                                           * b.at<double>(j, t + 1);
+                            digamma[t].at<double>(i, j) = v;
+                            g += v;
+                        }
+                        gamma.at<double>(i, t) = g;
+                    }
+                }
+                for (int i = 0; i < N; i++)
+                    gamma.at<double>(i, T - 1) = a.at<double>(i, T - 1);
+
+                // -- Accumulate expected counts from sequence k --
+                for (int i = 0; i < N; i++)
+                    piAcc.at<double>(0, i) += gamma.at<double>(i, 0);
+
+                for (int i = 0; i < N; i++) {
+                    double sumGammaA = 0;  // sum_{t=0..T-2} gamma_t(i)
+                    for (int t = 0; t < T - 1; t++) sumGammaA += gamma.at<double>(i, t);
+                    aDen.at<double>(0, i) += sumGammaA;
+                    for (int j = 0; j < N; j++) {
+                        double sumDigamma = 0;
+                        for (int t = 0; t < T - 1; t++)
+                            sumDigamma += digamma[t].at<double>(i, j);
+                        aNum.at<double>(i, j) += sumDigamma;
+                    }
+                    double sumGammaB = 0;  // sum_{t=0..T-1} gamma_t(i)
+                    for (int t = 0; t < T; t++) sumGammaB += gamma.at<double>(i, t);
+                    bDen.at<double>(0, i) += sumGammaB;
+                    for (int m = 0; m < M; m++) {
+                        double sumMasked = 0;
+                        for (int t = 0; t < T; t++)
+                            if (seqs.at<int>(k, t) == m)
+                                sumMasked += gamma.at<double>(i, t);
+                        bNum.at<double>(i, m) += sumMasked;
+                    }
+                }
+
+                // log P(O^(k) | lambda) = -sum_t log(c_t)
+                double logPk = 0;
+                for (int t = 0; t < T; t++) logPk += std::log(c.at<double>(0, t));
+                totalLogProb += -logPk;
+            }
+
+            // -- M-step: re-estimate lambda from pooled expected counts --
+            for (int i = 0; i < N; i++)
+                INIT.at<double>(0, i) = piAcc.at<double>(0, i) / (double)K;
+            for (int i = 0; i < N; i++)
+                for (int j = 0; j < N; j++)
+                    TRANS.at<double>(i, j) = aNum.at<double>(i, j) / aDen.at<double>(0, i);
+            for (int i = 0; i < N; i++)
+                for (int m = 0; m < M; m++)
+                    EMIS.at<double>(i, m) = bNum.at<double>(i, m) / bDen.at<double>(0, i);
+
+            correctModel(TRANS, EMIS, INIT);
+
+            iters++;
+            if (iters >= maxIters || totalLogProb <= oldLogProb) break;
+            oldLogProb = totalLogProb;
+        }
+    }
+
+    // Dump TRANS, EMIS, INIT to std::cout in a human-readable form.
+    /* ================================================================= */
+    static void printModel(const cv::Mat &TRANS, const cv::Mat &EMIS, const cv::Mat &INIT)
+    {
+        std::cout << "\nTRANS:\n";
+        for (int r = 0; r < TRANS.rows; r++) {
+            for (int c = 0; c < TRANS.cols; c++)
+                std::cout << TRANS.at<double>(r, c) << " ";
+            std::cout << "\n";
+        }
+        std::cout << "\nEMIS:\n";
+        for (int r = 0; r < EMIS.rows; r++) {
+            for (int c = 0; c < EMIS.cols; c++)
+                std::cout << EMIS.at<double>(r, c) << " ";
+            std::cout << "\n";
+        }
+        std::cout << "\nINIT:\n";
+        for (int r = 0; r < INIT.rows; r++) {
+            for (int c = 0; c < INIT.cols; c++)
+                std::cout << INIT.at<double>(r, c) << " ";
+            std::cout << "\n";
+        }
+        std::cout << "\n";
+    }
 };
 
-#endif CVHMM_H
+#endif /* CVHMM_H */
