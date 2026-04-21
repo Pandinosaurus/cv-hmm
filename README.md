@@ -226,27 +226,6 @@ g++ -std=c++11 -O2 -Wall -Wextra main.cpp -o demo $(pkg-config --cflags --libs o
 ./demo
 ```
 
-## Regression tests
-
-`test_hmm.py` is a Python re-implementation of everything in `CvHMM.h`,
-plus brute-force baselines. It checks four things:
-
-1. The scaled forward-backward's log `P(O)` matches a brute-force
-   forward pass to machine precision.
-2. Viterbi matches brute-force enumeration over all state paths
-   (for small `T`).
-3. Single-sequence Baum-Welch's log-likelihood is monotonic
-   non-decreasing across iterations (the defining property of EM).
-4. Multi-sequence Baum-Welch's *total* log-likelihood is monotonic
-   non-decreasing, and on a reasonable dataset it recovers the
-   underlying model parameters.
-
-Run with [uv](https://docs.astral.sh/uv/):
-
-```bash
-uv run --with numpy python test_hmm.py
-```
-
 ## Further reading
 
 If you want to understand what's happening under the hood, the single
@@ -289,8 +268,8 @@ HMM textbook (e.g. Rabiner's 1989 tutorial).
 The original 2012 implementation is preserved in the git history. The
 2026 rewrite keeps the `cv::Mat` matrix representation and a similar
 public API, replaces the single-sequence internals with a line-by-line
-transcription of Stamp's pseudo-code, adds a clean multi-sequence
-`trainBatch`, and ships the `test_hmm.py` regression harness.
+transcription of Stamp's pseudo-code, and adds a clean multi-sequence
+`trainBatch`.
 
 ## License
 
